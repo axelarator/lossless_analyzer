@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local Claude Code settings
+.claude/
+
+# Generated test fixtures (recreate with testdata/make_fixtures.sh)
+testdata/*.flac
+testdata/*.mp3
+testdata/*.wav
+
+# Editor / OS
+*.swp
+.DS_Store
