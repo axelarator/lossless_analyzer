@@ -35,7 +35,7 @@ def analyze_file(
 
         m = Metrics()
         m.effective_bits = dsp.effective_bits(raw)
-        m.peak_dbfs, m.rms_dbfs, m.crest_db = dsp.peak_rms_crest(mono)
+        m.peak_dbfs, m.rms_dbfs, m.crest_db = dsp.peak_rms_crest(pcm)
         m.dr = dsp.dynamic_range(pcm, sr)
         m.clipped_samples, m.clip_runs, m.clip_pct = dsp.clipping(pcm, m.effective_bits)
 

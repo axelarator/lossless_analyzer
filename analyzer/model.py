@@ -16,6 +16,7 @@ class Verdict(str, Enum):
     SUSPECT = "suspect"          # something looks off but it's not conclusive
     LIKELY_FAKE = "likely_fake"  # strong lossy-transcode signature
     UPSAMPLED = "upsampled"      # real content well below claimed Nyquist
+    LOSSY = "lossy"              # openly lossy file (MP3/AAC/Opus...), not a lossless source
     ERROR = "error"              # could not analyze
 
     @property
@@ -25,6 +26,7 @@ class Verdict(str, Enum):
             Verdict.SUSPECT: "Suspect",
             Verdict.LIKELY_FAKE: "Likely fake (lossy transcode)",
             Verdict.UPSAMPLED: "Upsampled",
+            Verdict.LOSSY: "Lossy file",
             Verdict.ERROR: "Error",
         }[self]
 
@@ -36,6 +38,7 @@ class Verdict(str, Enum):
             Verdict.SUSPECT: "SUSPECT",
             Verdict.LIKELY_FAKE: "FAKE",
             Verdict.UPSAMPLED: "UPSAMPLED",
+            Verdict.LOSSY: "LOSSY",
             Verdict.ERROR: "ERR",
         }[self]
 
@@ -47,6 +50,7 @@ class Verdict(str, Enum):
             Verdict.SUSPECT: "#f9a825",
             Verdict.LIKELY_FAKE: "#c62828",
             Verdict.UPSAMPLED: "#ad1457",
+            Verdict.LOSSY: "#1565c0",
             Verdict.ERROR: "#616161",
         }[self]
 
@@ -86,9 +90,10 @@ class Metrics:
     clip_pct: float = 0.0
     cutoff_hz: float = 0.0         # estimated top of real spectral content
     wall_hz: float = 0.0           # frequency of the steepest spectral cliff
-    wall_drop_db: float = 0.0      # dB drop across that cliff (~1.5 kHz)
-    shelf_db: float = -120.0       # spectrum level just above the cliff
-    noise_floor_db: float = -120.0   # spectrum floor near Nyquist
+    wall_drop_db: float = 0.0      # dB drop across that cliff (~1 kHz windows)
+    shelf_db: float = -120.0       # spectrum level above the cliff (dB rel. spectrum peak)
+    noise_floor_db: float = -120.0   # spectrum floor near Nyquist (dB rel. spectrum peak)
+    bit_padded: bool = False       # claims >=24-bit but only <=16 bits carry data
 
 
 @dataclass
@@ -129,7 +134,26 @@ class AnalysisResult:
             "verdict": self.verdict.value,
             "confidence": round(self.confidence, 2),
             "suspected_source": self.suspected_source,
+            "convertible": self.convertible,
         }
+
+    @property
+    def convertible(self) -> bool:
+        """Is this a good source for a lossy (e.g. 320k MP3) encode?
+
+        True for genuine lossless files and for files whose only problem is
+        being *more* than CD quality on paper (upsampled from CD rate, or
+        16-bit padded to 24-bit) — their real content is still full CD
+        quality. False for anything that looks lossy-sourced or unanalyzed.
+        """
+        v = self.verdict
+        if v == Verdict.GENUINE:
+            return True
+        if v == Verdict.UPSAMPLED:
+            return not self.suspected_source  # set when the pre-upsample source looks lossy
+        if v == Verdict.SUSPECT:
+            return self.metrics.bit_padded and not self.suspected_source
+        return False
 
     def as_dict(self) -> dict:
         """JSON-friendly dict (drops the spectrum arrays)."""
@@ -141,6 +165,7 @@ class AnalysisResult:
             "confidence": self.confidence,
             "reasons": self.reasons,
             "suspected_source": self.suspected_source,
+            "convertible": self.convertible,
             "error": self.error,
         }
         return d

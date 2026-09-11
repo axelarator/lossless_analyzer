@@ -1,44 +1,63 @@
 # Lossless Analyzer
 
-A desktop spectrum/quality analyzer for a local FLAC library. Point it at a
-folder and it tells you, per file, whether the audio is **truly lossless** or a
-**lossy transcode re-wrapped as FLAC** ("fake FLAC") or an **upsampled** file —
-plus dynamic range, clipping, and effective bit depth. Genuine files can be
-converted to MP3 for quick A/B listening on a portable player.
+A spectrum/quality analyzer for a local FLAC library, and a converter for
+turning the files that pass into **320 kbps MP3** for a portable player.
 
-Built for Linux (developed on CachyOS). Native GTK/Qt desktop app, **not** a web app.
+Point it at a folder and it tells you, per file, whether the audio is **truly
+lossless**, a **lossy transcode re-wrapped as FLAC** ("fake FLAC"), or
+**upsampled** — plus dynamic range, clipping, and effective bit depth. Files
+that are good sources are then encoded to MP3 with tags and cover art intact,
+mirroring your library's folder layout.
+
+Desktop Qt app plus a batch CLI. Runs on Linux (developed on CachyOS) and macOS.
 
 ## What it measures
 
 | Check | How |
 |-------|-----|
-| **Fake lossless** (lossy transcode) | Detects a lowpass *brick wall* in the spectrum. MP3/AAC encoders cut everything above a bitrate-dependent ceiling (~16 kHz at 128k, ~20 kHz at 320k). A sharp wall well below the 22.05 kHz Nyquist in a FLAC = transcoded from lossy. Reports a suspected source bitrate. |
-| **Upsampling** | A file claiming 96/192 kHz but whose real content stops near 22 kHz was upsampled from CD rate. Compares actual spectral content against the claimed Nyquist. |
+| **Fake lossless** (lossy transcode) | Looks for a lowpass *brick wall* below Nyquist with a dead-flat noise floor above it. LAME's lowpass depends on bitrate (~17 kHz at 128k, ~18.6 kHz at 192k, ~20.5 kHz at 320k; older/FhG encoders cut ~16 kHz at 128k). Reports a suspected source bitrate. |
+| **Upsampling** | A file claiming 88.2–192 kHz whose content stops at a hard wall near 22–24 kHz was upsampled from CD/48k rate. If that wall is even lower, the pre-upsample source was lossy too. |
 | **Effective bit depth** | A "24-bit" file padded from a 16-bit master shows 16 bits of real data. Found by inspecting the low bits of the decoded PCM. |
-| **Dynamic range (DR)** | TT/Pleasurize DR14-style metric — useful for spotting brickwall-limited "loudness war" masters. |
-| **Clipping** | Counts runs of consecutive full-scale samples (digital clipping). |
+| **Dynamic range (DR)** | TT/Pleasurize DR meter (3 s blocks, 2nd-highest block peak vs. RMS of the loudest 20%) — spots brickwall-limited "loudness war" masters. |
+| **Clipping** | Counts runs of ≥3 consecutive full-scale samples. |
 | **Spectrum + spectrogram** | Average power spectrum and an STFT spectrogram so you can eyeball edge cases yourself. |
 
-Each verdict comes with a **confidence score**, not just yes/no — 320 kbps MP3
-transcodes are genuinely hard to distinguish and get flagged as *suspect* rather
-than a false-confident *fake*.
+Each verdict comes with a **confidence score**, not just yes/no.
+
+### Verdicts and what gets converted
+
+| Verdict | Meaning | `--convert` |
+|---------|---------|-------------|
+| Likely genuine | No lossy wall | **converted** |
+| Upsampled (from CD rate) | Hi-res label, CD-quality content | **converted** — still a full-quality source |
+| Suspect, bit-padded only | 24-bit label, 16-bit content | **converted** — still full CD quality |
+| Suspect (band edge) | Looks like a transcode but not conclusive | listed for manual review |
+| Upsampled (from lossy) | Wall too low for a CD source | listed for manual review |
+| Likely fake | Clear lossy brick wall | skipped |
+| Lossy file | It's an MP3/AAC/Opus… already | skipped |
 
 ## Requirements
 
-Everything is already on a typical CachyOS install — **no `pip install` needed**:
-
-- `python` (3.11+)
-- `python-numpy`, `python-matplotlib`, `python-pyqt6`
+- Python 3.11+ with `numpy`, `matplotlib`, `PyQt6` (the last two only for the GUI)
 - `ffmpeg` (with `libmp3lame`) and `ffprobe`
+
+No `scipy`, `soundfile`, or `mutagen` — all decoding and metadata go through
+ffmpeg, so anything it reads works (FLAC, ALAC, WAV, AIFF, APE, WavPack, DSD…).
+
+**Linux (Arch/CachyOS)** — everything is packaged, no pip needed:
 
 ```sh
 sudo pacman -S --needed python-numpy python-matplotlib python-pyqt6 ffmpeg
 ```
 
-Audio decoding and metadata go through `ffmpeg`/`ffprobe` (so anything ffmpeg
-can read works: FLAC, ALAC, Wav, APE, WavPack, MP3, Opus…). No `scipy`,
-`soundfile`, or `mutagen` — deliberately, so it runs on bleeding-edge Python
-where those may lack wheels.
+**macOS** — ffmpeg from Homebrew, Python packages in a venv:
+
+```sh
+brew install ffmpeg
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python gui.py        # or: source .venv/bin/activate
+```
 
 ## Usage
 
@@ -49,11 +68,13 @@ where those may lack wheels.
 ```
 
 1. **Choose Directory** → pick your music folder (Recursive scans subfolders).
-2. **Scan** — analysis runs in parallel, off the UI thread.
-3. Browse the color-coded table. **Suspects only** hides the genuine files.
+2. **Scan** — analysis runs in parallel, off the UI thread. The button becomes **Stop**.
+3. Browse the color-coded table (click headers to sort). **Suspects only** hides genuine files.
 4. Click a row to see its spectrogram, average spectrum, metrics, and the
    reasons behind the verdict.
-5. **Convert to MP3** (quality dropdown, default V0) for A/B listening.
+5. **Convert to MP3** (quality dropdown, default 320). The output keeps the file's
+   folder path relative to the scanned directory. You get a warning first if the
+   file isn't a clean source.
 
 ### CLI (batch)
 
@@ -64,43 +85,61 @@ where those may lack wheels.
 # Full report to CSV + JSON, 4 workers
 ./cli.py ~/Music -r --csv report.csv --json report.json -j4
 
-# Convert every genuine file to V0 MP3 into ~/ipod
-./cli.py ~/Music -r --convert-genuine --quality V0 --out ~/ipod
+# Convert every good source to 320 kbps MP3 into ~/ipod
+./cli.py ~/Music -r --convert --out ~/ipod
 ```
 
-MP3 presets: `V0` (~245k VBR, default), `V2` (~190k), `320`, `256`, `192`.
-Conversions copy tags and embedded cover art and write ID3v2.3 (Rockbox-friendly).
+`--convert` encodes the convertible files (table above), mirrors the folder
+layout under `--out` (`~/Music/Artist/Album/01.flac` → `~/ipod/Artist/Album/01.mp3`,
+so same-named tracks from different albums don't collide), then prints the files
+to review by hand and the files it skipped. Existing MP3s are left alone, so
+re-running only encodes new files.
+
+MP3 presets (`--quality`): `320` (CBR, default), `V0` (~245k VBR), `V2` (~190k),
+`256`, `192`. All use LAME's recommended `-q 2` algorithm quality. Output is
+ID3v2.3 with tags and embedded cover art (Rockbox-friendly). Hi-res sources are
+resampled to 44.1 kHz (MP3 tops out at 48 kHz) and multichannel is downmixed to
+stereo.
+
+**320 CBR vs V0:** both are transparent to practically everyone. CBR spends
+320 kbps on every frame; V0 varies the bitrate per frame and averages ~220–260
+kbps, so files are ~25% smaller at the same perceived quality. With storage
+not an issue, 320 is the "maximum, no thinking" choice.
 
 ## How reliable is the fake detection?
 
-- **Low-bitrate transcodes (≤256 kbps)**: very reliable — the lowpass wall is
-  obvious and well below 20 kHz.
-- **320 kbps / V0 transcodes**: hard. Their cutoff (~20 kHz) is close to where
-  some genuine masters naturally roll off, so these surface as *suspect* with
-  modest confidence. Use the spectrogram to judge: a transcode shows a dead-flat
-  noise floor with a razor-sharp edge; genuine content tapers.
-- **Naturally dull / old masters** can look suspicious — confidence stays low
-  and the spectrogram tells the real story. This is why the tool reports
-  evidence, not just a verdict.
+Measured on real 44.1k masters passed through LAME 3.100 and re-wrapped as FLAC:
 
-## FLAC vs MP3 on the iPod Classic 7G (Rockbox + Meze Alba)
+- **Bright/loud material, ≤256 kbps:** reliably flagged as *likely fake*, with
+  the right bitrate family.
+- **320 kbps:** its wall (~20 kHz) sits where tight anti-alias filters of
+  genuine masters sit, so it's usually *suspect* rather than *fake*.
+- **Quiet or treble-light material:** there's little treble above the noise
+  floor for the encoder to cut, so the wall is shallow (15–25 dB). These are
+  caught by the flat-shelf check and surface as *suspect* with modest confidence.
+  A few very dull tracks can slip through entirely.
+- **V0 transcodes made with current LAME are undetectable here:** LAME 3.100
+  `-V0` applies no lowpass, so there is no wall to find. (Older LAME and many
+  other encoders do cut at ~19.5 kHz and are detected.)
+- **Genuine anti-alias filters** at 21–22 kHz can be very steep (up to 50 dB);
+  they're recognized by position and don't count against the file.
 
-Short answer: **keep FLAC as your archive; for the iPod, MP3 V0 is the smarter
-choice — but for battery life, not sound quality.**
+The tool reports evidence, not just a verdict — when in doubt, look at the
+spectrogram: a transcode shows a razor-sharp edge that stays at the same
+frequency for the whole track, with nothing above it.
 
-- **Sound quality**: Through the Meze Alba (a single-dynamic-driver earbud) you
-  will not hear a difference between FLAC and a well-encoded 320/V0 MP3. LAME V0
-  is transparent for essentially all listeners and material. The Alba's
-  resolution and the iPod's output stage are nowhere near the limiting factor.
-- **Battery life**: This is the real trade-off. The iPod Classic 6/7G uses a
-  low-power ARM (Samsung S5L8702). Decoding FLAC costs noticeably more CPU than
-  MP3, which shortens battery runtime on Rockbox. MP3 lets the CPU idle more.
-- **Storage**: You said it's a non-issue (flash mod), so that doesn't push the
-  decision either way.
+## FLAC vs MP3 on the iPod Classic (Rockbox)
 
-So: the spectrum analyzer's job is to make sure your *archive* is genuinely
-lossless. Once a file passes, transcode a V0 copy for the iPod and enjoy the
-longer battery life with no audible penalty on the Alba.
+- **Keep FLAC as your archive.** This analyzer's job is to make sure that
+  archive is genuinely lossless; the MP3s are disposable copies you can
+  regenerate at any time.
+- **Sound quality:** a well-encoded 320k or V0 MP3 is transparent for
+  essentially all listeners and material — earbuds and the iPod's output stage
+  are not the limiting factor.
+- **Battery life:** a minor factor either way. FLAC is actually one of the
+  cheapest codecs for Rockbox to decode; the extra cost is reading ~3–4× more
+  data from storage, which matters little on a flash mod.
+- **Why MP3 then:** smaller files and universal compatibility.
 
 ## Project layout
 
@@ -112,20 +151,23 @@ analyzer/
   analyze.py   orchestrator: path -> AnalysisResult
   convert.py   FLAC/etc -> MP3 (libmp3lame)
   model.py     dataclasses (StreamInfo, Metrics, Spectrum, AnalysisResult, Verdict)
-cli.py         batch terminal scanner
+cli.py         batch terminal scanner / converter
 gui.py         PyQt6 desktop app
 testdata/      make_fixtures.sh -> synthetic genuine/fake/upsampled fixtures
+tests/         unittest suite
 ```
 
-## Test fixtures
+## Tests
 
-The `testdata/` FLACs aren't committed (they're generated binaries). Recreate
-them with ffmpeg:
+The `testdata/` fixtures aren't committed (they're generated binaries).
+Recreate them with ffmpeg, then run the suite:
 
 ```sh
-./testdata/make_fixtures.sh
-./cli.py testdata --no-color     # sanity-check the detector
+bash testdata/make_fixtures.sh
+python -m unittest discover tests -v
+./cli.py testdata --no-color     # eyeball the verdicts
 ```
 
-This produces genuine, fake-transcode, upsampled, and clipped examples so you
-can confirm the verdicts behave as expected.
+The fixtures cover genuine (white-noise, music-like, quiet, hi-res), MP3
+transcodes at several bitrates, a padded 24-bit file, clean and lossy-sourced
+upsamples, an openly lossy MP3, and a clipped tone.

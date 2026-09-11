@@ -24,7 +24,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 from analyzer import analyze_file, scan_one  # noqa: E402
 from analyzer.decode import AUDIO_EXTS, have_tools  # noqa: E402
 from analyzer.model import AnalysisResult, Verdict  # noqa: E402
-from analyzer.convert import convert_to_mp3, PRESETS  # noqa: E402
+from analyzer.convert import convert_to_mp3, DEFAULT_QUALITY, PRESETS  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -49,16 +49,19 @@ class ScanWorker(QtCore.QThread):
     def run(self):
         total = len(self.files)
         done = 0
+        ex = ProcessPoolExecutor(max_workers=self.jobs)
         try:
-            with ProcessPoolExecutor(max_workers=self.jobs) as ex:
-                futs = {ex.submit(scan_one, f): f for f in self.files}
-                for fut in as_completed(futs):
-                    if self._stop:
-                        break
-                    self.result.emit(fut.result())
-                    done += 1
-                    self.progress.emit(done, total)
+            futs = {ex.submit(scan_one, f): f for f in self.files}
+            for fut in as_completed(futs):
+                if self._stop:
+                    break
+                self.result.emit(fut.result())
+                done += 1
+                self.progress.emit(done, total)
         finally:
+            # Drop queued files instead of waiting for the whole library
+            # (a `with` block would block here until every file finished).
+            ex.shutdown(wait=False, cancel_futures=True)
             self.done.emit()
 
 
@@ -78,12 +81,13 @@ class DetailWorker(QtCore.QThread):
 class ConvertWorker(QtCore.QThread):
     done = QtCore.pyqtSignal(object)  # ConvertResult
 
-    def __init__(self, src, out_dir, quality):
+    def __init__(self, src, out_dir, quality, rel_to=None):
         super().__init__()
-        self.src, self.out_dir, self.quality = src, out_dir, quality
+        self.src, self.out_dir, self.quality, self.rel_to = src, out_dir, quality, rel_to
 
     def run(self):
-        self.done.emit(convert_to_mp3(self.src, self.out_dir, self.quality, overwrite=True))
+        self.done.emit(convert_to_mp3(self.src, self.out_dir, self.quality,
+                                      overwrite=True, rel_to=self.rel_to))
 
 
 # --------------------------------------------------------------------------- #
@@ -158,6 +162,17 @@ class SpectrumView(FigureCanvasQTAgg):
 # Main window
 # --------------------------------------------------------------------------- #
 COLUMNS = ["File", "Codec", "Rate", "Bits", "Cutoff", "DR", "Clip", "Verdict", "Conf"]
+SORT_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+
+
+class SortItem(QtWidgets.QTableWidgetItem):
+    """Table cell that sorts by a numeric key (SORT_ROLE) when one is set."""
+
+    def __lt__(self, other):
+        a, b = self.data(SORT_ROLE), other.data(SORT_ROLE)
+        if a is not None and b is not None:
+            return a < b
+        return super().__lt__(other)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -167,7 +182,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1280, 760)
         self.results: dict[str, AnalysisResult] = {}
         self.scan_worker: ScanWorker | None = None
-        self.detail_worker: DetailWorker | None = None
+        # Every DetailWorker stays referenced until its thread finishes; letting
+        # a running QThread be garbage-collected aborts the whole app.
+        self.detail_workers: set[DetailWorker] = set()
         self.convert_worker: ConvertWorker | None = None
         self.scan_dir = os.path.expanduser("~")
 
@@ -248,6 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         conv.addWidget(QtWidgets.QLabel("MP3 quality:"))
         self.quality_combo = QtWidgets.QComboBox()
         self.quality_combo.addItems(list(PRESETS.keys()))
+        self.quality_combo.setCurrentText(DEFAULT_QUALITY)
         conv.addWidget(self.quality_combo)
         self.btn_convert = QtWidgets.QPushButton("Convert to MP3")
         self.btn_convert.clicked.connect(self.convert_selected)
@@ -320,9 +338,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scan.setText("Scan")
         self.table.setSortingEnabled(True)
         n = len(self.results)
-        fakes = sum(1 for r in self.results.values()
-                    if r.verdict in (Verdict.LIKELY_FAKE, Verdict.UPSAMPLED, Verdict.SUSPECT))
-        self.status.setText(f"Done — {n} file(s), {fakes} flagged.")
+        fakes = sum(1 for r in self.results.values() if r.verdict != Verdict.GENUINE)
+        good = sum(1 for r in self.results.values() if r.convertible)
+        self.status.setText(f"Done — {n} file(s), {fakes} flagged, {good} OK to convert.")
 
     def add_result(self, res: AnalysisResult):
         self.results[res.info.path] = res
@@ -347,13 +365,13 @@ class MainWindow(QtWidgets.QMainWindow):
         color = QtGui.QColor(res.verdict.color)
         full_verdict = res.verdict.label + (
             f" [{res.suspected_source}]" if res.suspected_source else "")
+        # Numeric sort keys for the numeric-ish columns.
+        keys = {2: i.sample_rate, 3: m.effective_bits, 4: m.cutoff_hz, 5: m.dr,
+                6: m.clip_runs, 8: res.confidence}
         for col, txt in enumerate(cells):
-            item = QtWidgets.QTableWidgetItem()
-            # Numeric sort for the numeric-ish columns.
-            if col in (5, 8):
-                item.setData(QtCore.Qt.ItemDataRole.DisplayRole, txt)
-            else:
-                item.setText(txt)
+            item = SortItem(txt)
+            if col in keys:
+                item.setData(SORT_ROLE, float(keys[col]))
             if col == 0:
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, i.path)
                 item.setToolTip(i.path)
@@ -399,9 +417,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._show_text(res)
         self.plot.clear_plot("Computing spectrogram…")
         # Compute the spectrogram off-thread.
-        self.detail_worker = DetailWorker(path)
-        self.detail_worker.ready.connect(self._on_detail)
-        self.detail_worker.start()
+        worker = DetailWorker(path)
+        worker.ready.connect(self._on_detail)
+        worker.finished.connect(lambda w=worker: self.detail_workers.discard(w))
+        self.detail_workers.add(worker)
+        worker.start()
 
     def _on_detail(self, res: AnalysisResult):
         # Only render if it's still the selected file.
@@ -428,10 +448,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "",
             f"effective bit depth : {m.effective_bits} bit",
             f"content top         : {m.cutoff_hz/1000:.2f} kHz  "
-            f"(Nyquist {i.nyquist/1000:g} kHz, floor {m.noise_floor_db:.0f} dBFS)",
+            f"(Nyquist {i.nyquist/1000:g} kHz, floor {m.noise_floor_db:.0f} dB rel. peak)",
             f"steepest band edge  : {m.wall_drop_db:.0f} dB drop at "
-            f"{m.wall_hz/1000:.2f} kHz, shelf {m.shelf_db:.0f} dBFS  "
-            f"(lossy walls are >{35:.0f} dB; genuine rolloffs <~16 dB)",
+            f"{m.wall_hz/1000:.2f} kHz, shelf {m.shelf_db:.0f} dB rel. peak",
+            f"                      (lossy: shelf = floor; genuine edges below "
+            f"Nyquist rarely exceed ~17 dB)",
             f"dynamic range (DR)  : {m.dr:.1f}",
             f"peak / RMS          : {m.peak_dbfs:.2f} / {m.rms_dbfs:.2f} dBFS "
             f"(crest {m.crest_db:.1f} dB)",
@@ -454,13 +475,26 @@ class MainWindow(QtWidgets.QMainWindow):
         path = self._selected_path()
         if not path:
             return
+        res = self.results.get(path)
+        if res and not res.convertible:
+            answer = QtWidgets.QMessageBox.question(
+                self, "Not a clean source",
+                f"This file is flagged “{res.verdict.label}”"
+                + (f" ({res.suspected_source})" if res.suspected_source else "")
+                + ". Encoding it to MP3 will not give you a true "
+                  f"{self.quality_combo.currentText()} copy.\n\nConvert anyway?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
         out = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Output folder for MP3", os.path.dirname(path))
+            self, "Output folder for MP3 (library layout is mirrored)",
+            os.path.dirname(path))
         if not out:
             return
         self.btn_convert.setEnabled(False)
         self.status.setText("Converting…")
-        self.convert_worker = ConvertWorker(path, out, self.quality_combo.currentText())
+        self.convert_worker = ConvertWorker(path, out, self.quality_combo.currentText(),
+                                            rel_to=self.scan_dir)
         self.convert_worker.done.connect(self._convert_done)
         self.convert_worker.start()
 

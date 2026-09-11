@@ -43,9 +43,19 @@ def effective_bits(raw_int32: np.ndarray) -> int:
 # --------------------------------------------------------------------------- #
 # Loudness / dynamics
 # --------------------------------------------------------------------------- #
-def peak_rms_crest(mono: np.ndarray) -> tuple[float, float, float]:
-    peak = float(np.max(np.abs(mono))) if mono.size else 0.0
-    rms = float(np.sqrt(np.mean(mono**2))) if mono.size else 0.0
+def peak_rms_crest(pcm: np.ndarray) -> tuple[float, float, float]:
+    """Sample peak and RMS in dBFS, taken from the loudest channel.
+
+    Measured per channel rather than on a mono downmix, which would
+    understate the peak of wide or out-of-phase material.
+    """
+    if pcm.ndim == 1:
+        pcm = pcm[:, None]
+    if pcm.size:
+        peak = float(np.max(np.abs(pcm)))
+        rms = float(np.max(np.sqrt(np.mean(pcm**2, axis=0))))
+    else:
+        peak = rms = 0.0
     peak_db = 20.0 * np.log10(max(peak, EPS))
     rms_db = 20.0 * np.log10(max(rms, EPS))
     return peak_db, rms_db, peak_db - rms_db
@@ -54,8 +64,10 @@ def peak_rms_crest(mono: np.ndarray) -> tuple[float, float, float]:
 def dynamic_range(pcm: np.ndarray, sr: int) -> float:
     """TT/Pleasurize DR value (the DR14 meter), averaged across channels.
 
-    Per channel: 3 s blocks -> block RMS (with the 2x convention) -> quadratic
-    mean of the loudest 20% of blocks -> 20*log10(2nd-highest peak / that RMS).
+    Per channel: 3 s blocks -> block RMS (with the 2x convention) and block
+    peak -> quadratic mean of the loudest 20% of block RMS values ->
+    20*log10(2nd-highest *block* peak / that RMS). Using the 2nd-highest block
+    peak (not sample) is what makes the meter ignore a single stray transient.
     """
     if pcm.ndim == 1:
         pcm = pcm[:, None]
@@ -63,7 +75,7 @@ def dynamic_range(pcm: np.ndarray, sr: int) -> float:
     n_blocks = pcm.shape[0] // block
     if n_blocks < 1:
         # Too short for the windowed method; fall back to crest factor.
-        _, _, crest = peak_rms_crest(to_mono(pcm))
+        _, _, crest = peak_rms_crest(pcm)
         return max(crest, 0.0)
 
     drs = []
@@ -74,9 +86,8 @@ def dynamic_range(pcm: np.ndarray, sr: int) -> float:
         n_top = max(int(round(0.2 * n_blocks)), 1)
         top = np.sort(block_rms)[::-1][:n_top]
         rms_avg = np.sqrt(np.mean(top**2))
-        # Second-highest absolute peak sample.
-        absx = np.abs(pcm[:, c])
-        peak2 = np.partition(absx, -2)[-2] if absx.size >= 2 else float(absx.max())
+        block_peak = np.sort(np.abs(x).max(axis=1))
+        peak2 = block_peak[-2] if block_peak.size >= 2 else block_peak[-1]
         dr = 20.0 * np.log10(max(peak2, EPS) / max(rms_avg, EPS))
         drs.append(dr)
     return float(np.clip(np.mean(drs), 0.0, 30.0))
@@ -215,7 +226,11 @@ def estimate_cutoff(freqs: np.ndarray, power_db: np.ndarray, sr: int) -> CutoffI
     # --- Find the steepest cliff in the upper band ------------------------- #
     # Compare the median level in a ~1 kHz window just below each candidate
     # frequency against the median just above it; the largest such step is the
-    # wall. Restrict the search to 11 kHz .. 0.995*Nyquist.
+    # wall. Restrict the search to 11 kHz .. 0.995*Nyquist. The window above
+    # each candidate needs room, so in practice the search stops ~1 kHz short
+    # of Nyquist (~21.05 kHz at 44.1k, ~0.95*Nyquist): an anti-alias filter at
+    # 21.5-22 kHz registers *at* that ceiling, which verdict.py treats as
+    # "wall at Nyquist" rather than a lossy lowpass.
     w = max(int(round(1000.0 / bin_hz)), 2)
     lo_i = int(np.searchsorted(freqs, 11000.0))
     hi_i = int(np.searchsorted(freqs, 0.995 * nyq))
