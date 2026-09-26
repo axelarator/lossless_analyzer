@@ -75,6 +75,13 @@ python3 -m venv .venv
 5. **Convert to MP3** (quality dropdown, default 320). The output keeps the file's
    folder path relative to the scanned directory. You get a warning first if the
    file isn't a clean source.
+6. **Library root** controls where output paths are anchored — see
+   [Folder layout in the output](#folder-layout-in-the-output).
+7. **Convert folder to MP3…** bulk-converts the whole chosen folder without
+   scanning it first — pick an output folder, confirm the count, and the progress
+   bar tracks it. The button becomes **Stop**. Lossy sources are skipped unless
+   **Include lossy sources** is ticked, and any failures are listed at the end
+   with an option to save them to a file.
 
 ### CLI (batch)
 
@@ -87,6 +94,12 @@ python3 -m venv .venv
 
 # Convert every good source to 320 kbps MP3 into ~/ipod
 ./cli.py ~/Music -r --convert --out ~/ipod
+
+# Bulk: convert the whole library to MP3 without analyzing it first
+./cli.py ~/Music -r --bulk-convert --out ~/ipod
+
+# See what that would write before committing to it
+./cli.py ~/Music -r --bulk-convert --out ~/ipod --dry-run
 ```
 
 `--convert` encodes the convertible files (table above), mirrors the folder
@@ -94,6 +107,61 @@ layout under `--out` (`~/Music/Artist/Album/01.flac` → `~/ipod/Artist/Album/01
 so same-named tracks from different albums don't collide), then prints the files
 to review by hand and the files it skipped. Existing MP3s are left alone, so
 re-running only encodes new files.
+
+### Bulk convert
+
+`--bulk-convert` is the mode for filling a player from a large library. It skips
+the analysis entirely and just encodes everything it finds, in parallel across
+all your cores — for thousands of files, decoding each one to PCM to compute
+spectra first would cost hours for no benefit. Your originals are only ever read;
+nothing is moved or modified.
+
+| Flag | Effect |
+| --- | --- |
+| `--out DIR` | Required. Where the MP3s go; folder layout is mirrored. |
+| `--dry-run` | List what would be written, encode nothing. |
+| `--overwrite` | Re-encode files whose MP3 already exists. |
+| `--include-lossy` | Also convert mp3/ogg/aac sources (off by default). |
+| `--error-log FILE` | Write failed sources and their ffmpeg errors here. |
+| `--library-root DIR` | Anchor output paths at this folder (see below). |
+| `-j N` | Worker count (default: all cores). |
+
+Files already present in the output are skipped, so an interrupted run resumes
+where it left off — just run the same command again. Partial encodes are written
+to a `.part` file and renamed only on success, so a killed run never leaves a
+truncated MP3 that a later run would mistake for finished work.
+
+Lossy sources are skipped by default: re-encoding an MP3 to MP3 only loses more
+quality, and it keeps a re-run from picking up its own output. Pointing `--out`
+inside the folder you're scanning is refused for the same reason.
+
+#### Folder layout in the output
+
+Output paths are mirrored relative to a *library root*. By default that's the
+**parent of the folder you point at**, so the folder you picked is reproduced in
+the output rather than flattened away:
+
+```sh
+./cli.py ~/Music/Artist -r --bulk-convert --out ~/ipod
+# ~/Music/Artist/Album/01.flac  ->  ~/ipod/Artist/Album/01.mp3
+```
+
+Pass `--library-root` to anchor somewhere else. Set it to your library and every
+run agrees, whether you convert everything at once or one artist at a time:
+
+```sh
+# whole library
+./cli.py ~/Music -r --bulk-convert --out ~/ipod --library-root ~/Music
+# ~/Music/Artist/Album/01.flac  ->  ~/ipod/Artist/Album/01.mp3
+
+# just one artist later — lands in the same place, so it's skipped, not duplicated
+./cli.py ~/Music/Artist -r --bulk-convert --out ~/ipod --library-root ~/Music
+# ~/Music/Artist/Album/01.flac  ->  ~/ipod/Artist/Album/01.mp3
+```
+
+Without `--library-root`, converting `~/Music` itself would nest everything under
+`~/ipod/Music/`. In the GUI the same setting is the **Library root** field, which
+shows the auto-chosen parent until you set one, and **Auto** puts it back.
 
 MP3 presets (`--quality`): `320` (CBR, default), `V0` (~245k VBR), `V2` (~190k),
 `256`, `192`. All use LAME's recommended `-q 2` algorithm quality. Output is
@@ -150,6 +218,7 @@ analyzer/
   verdict.py   metrics -> verdict + confidence + suspected source
   analyze.py   orchestrator: path -> AnalysisResult
   convert.py   FLAC/etc -> MP3 (libmp3lame)
+  bulk.py      file gathering + parallel bulk conversion (shared by cli and gui)
   model.py     dataclasses (StreamInfo, Metrics, Spectrum, AnalysisResult, Verdict)
 cli.py         batch terminal scanner / converter
 gui.py         PyQt6 desktop app

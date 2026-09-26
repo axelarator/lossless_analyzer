@@ -21,6 +21,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from analyzer import analyze_file, dsp  # noqa: E402
+from analyzer.bulk import (  # noqa: E402
+    bulk_convert, check_out_dir, filter_lossless, gather_files, mirror_root,
+)
 from analyzer.convert import convert_to_mp3, output_path  # noqa: E402
 from analyzer.decode import have_tools, probe  # noqa: E402
 from analyzer.model import Metrics, StreamInfo, Verdict  # noqa: E402
@@ -221,6 +224,166 @@ class TestConvert(unittest.TestCase):
             ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
              "-of", "csv=p=0", cr.output], capture_output=True, text=True).stdout.split()
         self.assertIn("video", streams)  # attached cover art
+
+
+# --------------------------------------------------------------------------- #
+# Bulk conversion
+# --------------------------------------------------------------------------- #
+class TestGather(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.lib = os.path.join(self.tmp, "lib")
+        os.makedirs(os.path.join(self.lib, "Album"))
+        for name in ("top.flac", "top.mp3", "notes.txt"):
+            open(os.path.join(self.lib, name), "wb").close()
+        for name in ("deep.flac", "deep.ogg"):
+            open(os.path.join(self.lib, "Album", name), "wb").close()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_recursive_records_the_scan_root(self):
+        files = gather_files([self.lib], recursive=True)
+        self.assertEqual(sorted(os.path.relpath(p, self.lib) for p in files),
+                         [os.path.join("Album", "deep.flac"),
+                          os.path.join("Album", "deep.ogg"),
+                          "top.flac", "top.mp3"])
+        # Anchored at the parent, so "lib" itself shows up in output paths.
+        self.assertEqual(set(files.values()), {self.tmp})
+
+    def test_non_recursive_stays_at_the_top(self):
+        files = gather_files([self.lib], recursive=False)
+        self.assertEqual(sorted(os.path.basename(p) for p in files),
+                         ["top.flac", "top.mp3"])
+
+    def test_files_named_directly_have_no_root(self):
+        direct = os.path.join(self.lib, "top.flac")
+        self.assertEqual(gather_files([direct], recursive=True), {direct: None})
+
+    def test_files_named_directly_are_placed_under_a_library_root(self):
+        direct = os.path.join(self.lib, "Album", "deep.flac")
+        files = gather_files([direct], recursive=True, library_root=self.lib)
+        self.assertEqual(files, {direct: os.path.abspath(self.lib)})
+
+    def test_scanned_folder_is_reproduced_in_the_output(self):
+        # The reported bug: scanning an artist folder dropped the artist level.
+        artist = os.path.join(self.lib, "Album")
+        files = gather_files([artist], recursive=True)
+        root = files[os.path.join(artist, "deep.flac")]
+        self.assertEqual(output_path(os.path.join(artist, "deep.flac"), "/ipod", root),
+                         "/ipod/Album/deep.mp3")
+
+    def test_library_root_makes_both_scan_depths_agree(self):
+        deep = os.path.join(self.lib, "Album", "deep.flac")
+        whole = gather_files([self.lib], recursive=True, library_root=self.lib)
+        part = gather_files([os.path.join(self.lib, "Album")], recursive=True,
+                            library_root=self.lib)
+        self.assertEqual(output_path(deep, "/ipod", whole[deep]),
+                         output_path(deep, "/ipod", part[deep]))
+        self.assertEqual(output_path(deep, "/ipod", whole[deep]),
+                         "/ipod/Album/deep.mp3")
+
+    def test_lossless_filter_drops_lossy_sources(self):
+        files = gather_files([self.lib], recursive=True)
+        kept = sorted(os.path.basename(p) for p in filter_lossless(files))
+        self.assertEqual(kept, ["deep.flac", "top.flac"])
+
+    def test_out_dir_inside_scan_root_is_rejected(self):
+        self.assertIsNotNone(check_out_dir(os.path.join(self.lib, "out"), [self.lib]))
+        self.assertIsNotNone(check_out_dir(self.lib, [self.lib]))
+        self.assertIsNone(check_out_dir(os.path.join(self.tmp, "ipod"), [self.lib]))
+
+    def test_sibling_directory_is_not_treated_as_inside(self):
+        # "/tmp/x/lib-out" must not look like it is under "/tmp/x/lib".
+        self.assertIsNone(check_out_dir(self.lib + "-out", [self.lib]))
+
+    def test_mirror_root_defaults_to_the_parent(self):
+        self.assertEqual(mirror_root("/Music/Artist"), "/Music")
+        self.assertEqual(mirror_root("/Music/Artist", "/Music"), "/Music")
+
+
+@unittest.skipUnless(have_tools(), "ffmpeg/ffprobe not installed")
+class TestBulkConvert(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.lib = os.path.join(self.tmp, "lib")
+        src = fixture("genuine_44k.flac")
+        for album in ("A", "B"):
+            os.makedirs(os.path.join(self.lib, album))
+            shutil.copy(src, os.path.join(self.lib, album, "01 Intro.flac"))
+        self.out = os.path.join(self.tmp, "out")
+        self.files = gather_files([self.lib], recursive=True, library_root=self.lib)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _outputs(self):
+        return sorted(os.path.relpath(os.path.join(r, n), self.out)
+                      for r, _, names in os.walk(self.out) for n in names)
+
+    def test_converts_in_parallel_mirroring_layout(self):
+        summary = bulk_convert(self.files, self.out, jobs=2)
+        self.assertEqual((summary.converted, summary.skipped, summary.failed),
+                         (2, 0, 0))
+        self.assertEqual(self._outputs(),
+                         [os.path.join("A", "01 Intro.mp3"),
+                          os.path.join("B", "01 Intro.mp3")])
+
+    def test_default_anchor_nests_the_scanned_folder(self):
+        # Converting ~/lib/A on its own still lands at <out>/A/, not <out>/.
+        album = os.path.join(self.lib, "A")
+        files = gather_files([album], recursive=True)
+        bulk_convert(files, self.out, jobs=2)
+        self.assertEqual(self._outputs(), [os.path.join("A", "01 Intro.mp3")])
+
+    def test_sources_are_left_untouched(self):
+        before = {p: os.stat(p).st_mtime_ns for p in self.files}
+        bulk_convert(self.files, self.out, jobs=2)
+        self.assertEqual({p: os.stat(p).st_mtime_ns for p in self.files}, before)
+
+    def test_rerun_skips_and_rewrites_nothing(self):
+        bulk_convert(self.files, self.out, jobs=2)
+        mtimes = {n: os.stat(os.path.join(self.out, n)).st_mtime_ns
+                  for n in self._outputs()}
+        summary = bulk_convert(self.files, self.out, jobs=2)
+        self.assertEqual((summary.converted, summary.skipped, summary.failed),
+                         (0, 2, 0))
+        self.assertEqual({n: os.stat(os.path.join(self.out, n)).st_mtime_ns
+                          for n in self._outputs()}, mtimes)
+
+    def test_overwrite_re_encodes(self):
+        bulk_convert(self.files, self.out, jobs=2)
+        summary = bulk_convert(self.files, self.out, jobs=2, overwrite=True)
+        self.assertEqual((summary.converted, summary.skipped), (2, 0))
+
+    def test_dry_run_writes_nothing(self):
+        seen = []
+        summary = bulk_convert(self.files, self.out, dry_run=True,
+                               progress_cb=lambda d, t, s, r: seen.append(r.output))
+        self.assertEqual(summary.converted, 2)
+        self.assertFalse(os.path.exists(self.out))
+        self.assertEqual(len(seen), 2)
+
+    def test_one_bad_file_does_not_abort_the_run(self):
+        bad = os.path.join(self.lib, "A", "broken.flac")
+        with open(bad, "wb") as fh:
+            fh.write(b"not audio at all")
+        files = gather_files([self.lib], recursive=True, library_root=self.lib)
+        summary = bulk_convert(files, self.out, jobs=2)
+        self.assertEqual((summary.converted, summary.failed), (2, 1))
+        self.assertEqual([os.path.basename(p) for p, _ in summary.failures],
+                         ["broken.flac"])
+
+    def test_progress_callback_counts_up_to_total(self):
+        seen = []
+        bulk_convert(self.files, self.out, jobs=2,
+                     progress_cb=lambda d, t, s, r: seen.append((d, t)))
+        self.assertEqual(seen, [(1, 2), (2, 2)])
+
+    def test_empty_input_is_a_no_op(self):
+        summary = bulk_convert({}, self.out)
+        self.assertEqual(summary.total, 0)
+        self.assertFalse(os.path.exists(self.out))
 
 
 if __name__ == "__main__":

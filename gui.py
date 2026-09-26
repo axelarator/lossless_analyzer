@@ -3,7 +3,8 @@
 
 Pick a directory, scan it (in parallel, off the UI thread), browse results in a
 color-coded table, inspect a file's spectrogram / average spectrum / metrics in
-the detail pane, and convert genuine files to MP3 for A/B listening.
+the detail pane, and convert genuine files to MP3 for A/B listening. A whole
+folder can also be bulk-converted to MP3 without scanning it first.
 
 Run:  ./gui.py   (or  python3 gui.py)
 """
@@ -22,7 +23,10 @@ from matplotlib.figure import Figure  # noqa: E402
 from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from analyzer import analyze_file, scan_one  # noqa: E402
-from analyzer.decode import AUDIO_EXTS, have_tools  # noqa: E402
+from analyzer.bulk import (  # noqa: E402
+    bulk_convert, check_out_dir, filter_lossless, gather_files, mirror_root,
+)
+from analyzer.decode import have_tools  # noqa: E402
 from analyzer.model import AnalysisResult, Verdict  # noqa: E402
 from analyzer.convert import convert_to_mp3, DEFAULT_QUALITY, PRESETS  # noqa: E402
 
@@ -88,6 +92,33 @@ class ConvertWorker(QtCore.QThread):
     def run(self):
         self.done.emit(convert_to_mp3(self.src, self.out_dir, self.quality,
                                       overwrite=True, rel_to=self.rel_to))
+
+
+class BulkConvertWorker(QtCore.QThread):
+    """Encode a whole library to MP3 off the UI thread."""
+
+    progress = QtCore.pyqtSignal(int, int, str)   # done, total, source path
+    finished_summary = QtCore.pyqtSignal(object)  # BulkSummary
+
+    def __init__(self, files: dict[str, str | None], out_dir: str, quality: str,
+                 jobs: int):
+        super().__init__()
+        self.files, self.out_dir, self.quality = files, out_dir, quality
+        self.jobs = max(jobs, 1)
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        summary = bulk_convert(
+            self.files, out_dir=self.out_dir, quality=self.quality,
+            jobs=self.jobs,
+            progress_cb=lambda done, total, src, res:
+                self.progress.emit(done, total, src),
+            should_stop=lambda: self._stop,
+        )
+        self.finished_summary.emit(summary)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +217,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # a running QThread be garbage-collected aborts the whole app.
         self.detail_workers: set[DetailWorker] = set()
         self.convert_worker: ConvertWorker | None = None
+        self.bulk_worker: BulkConvertWorker | None = None
         self.scan_dir = os.path.expanduser("~")
+        self.out_dir = ""
+        # None = anchor output paths at the parent of the scanned folder, so the
+        # folder you picked is reproduced in the output. Set it to your library
+        # root to keep paths identical no matter which subfolder you convert.
+        self.library_root: str | None = None
 
         self._build_ui()
         if not have_tools():
@@ -278,6 +315,42 @@ class MainWindow(QtWidgets.QMainWindow):
         conv.addStretch(1)
         dl.addLayout(conv)
 
+        # Bulk convert row — works straight off the chosen folder, no scan needed.
+        bulk = QtWidgets.QHBoxLayout()
+        self.btn_bulk = QtWidgets.QPushButton("Convert folder to MP3…")
+        self.btn_bulk.setToolTip(
+            "Convert every lossless file in the chosen folder to MP3.\n"
+            "Originals are never modified. Files already converted are skipped.")
+        self.btn_bulk.clicked.connect(self.bulk_convert_folder)
+        bulk.addWidget(self.btn_bulk)
+        self.lossy_cb = QtWidgets.QCheckBox("Include lossy sources")
+        self.lossy_cb.setToolTip(
+            "Also convert mp3/ogg/aac sources. Off by default: re-encoding "
+            "lossy audio only loses more quality.")
+        bulk.addWidget(self.lossy_cb)
+        bulk.addStretch(1)
+        dl.addLayout(bulk)
+
+        # Library root row — what output paths are mirrored relative to.
+        rootrow = QtWidgets.QHBoxLayout()
+        rootrow.addWidget(QtWidgets.QLabel("Library root:"))
+        self.root_label = QtWidgets.QLineEdit()
+        self.root_label.setReadOnly(True)
+        self.root_label.setToolTip(
+            "Output paths are mirrored relative to this folder.\n"
+            "Set it to your music library so converting one artist lands at\n"
+            "<output>/Artist/Album/ just as it sits in the library.")
+        rootrow.addWidget(self.root_label, 1)
+        btn_root = QtWidgets.QPushButton("Set…")
+        btn_root.clicked.connect(self.choose_library_root)
+        rootrow.addWidget(btn_root)
+        self.btn_root_auto = QtWidgets.QPushButton("Auto")
+        self.btn_root_auto.setToolTip("Go back to anchoring at the scanned folder's parent.")
+        self.btn_root_auto.clicked.connect(self.clear_library_root)
+        rootrow.addWidget(self.btn_root_auto)
+        dl.addLayout(rootrow)
+        self._refresh_root_label()
+
         split.addWidget(detail)
         split.setSizes([620, 660])
 
@@ -294,24 +367,41 @@ class MainWindow(QtWidgets.QMainWindow):
         if d:
             self.scan_dir = d
             self.dir_label.setText(d)
+            self._refresh_root_label()
+
+    def _effective_root(self) -> str | None:
+        return mirror_root(self.scan_dir, self.library_root)
+
+    def _refresh_root_label(self):
+        root = self._effective_root() or ""
+        self.root_label.setText(
+            root if self.library_root else f"{root}   (auto: parent of scanned folder)")
+        self.btn_root_auto.setEnabled(self.library_root is not None)
+
+    def choose_library_root(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Library root (output paths are mirrored relative to this)",
+            self.library_root or self.scan_dir)
+        if d:
+            self.library_root = d
+            self._refresh_root_label()
+
+    def clear_library_root(self):
+        self.library_root = None
+        self._refresh_root_label()
 
     def _gather(self) -> list[str]:
-        files = []
-        if self.recursive_cb.isChecked():
-            for root, _, names in os.walk(self.scan_dir):
-                for n in names:
-                    if os.path.splitext(n)[1].lower() in AUDIO_EXTS:
-                        files.append(os.path.join(root, n))
-        else:
-            for n in os.listdir(self.scan_dir):
-                fp = os.path.join(self.scan_dir, n)
-                if os.path.isfile(fp) and os.path.splitext(n)[1].lower() in AUDIO_EXTS:
-                    files.append(fp)
-        return sorted(files)
+        return list(gather_files([self.scan_dir], self.recursive_cb.isChecked(),
+                                 self.library_root))
 
     def start_scan(self):
         if self.scan_worker and self.scan_worker.isRunning():
             self.scan_worker.stop()
+            return
+        if self.bulk_worker and self.bulk_worker.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, "Conversion running",
+                "Stop the bulk conversion before scanning.")
             return
         files = self._gather()
         if not files:
@@ -494,7 +584,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_convert.setEnabled(False)
         self.status.setText("Converting…")
         self.convert_worker = ConvertWorker(path, out, self.quality_combo.currentText(),
-                                            rel_to=self.scan_dir)
+                                            rel_to=self._effective_root())
         self.convert_worker.done.connect(self._convert_done)
         self.convert_worker.start()
 
@@ -505,6 +595,88 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.status.setText(f"Convert failed: {cr.message}")
             QtWidgets.QMessageBox.warning(self, "Conversion failed", cr.message)
+
+    # -- Bulk conversion ---------------------------------------------------- #
+    def bulk_convert_folder(self):
+        if self.bulk_worker and self.bulk_worker.isRunning():
+            self.bulk_worker.stop()
+            self.status.setText("Stopping…")
+            return
+        if self.scan_worker and self.scan_worker.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, "Scan running",
+                "Stop the scan before starting a bulk conversion.")
+            return
+
+        files = gather_files([self.scan_dir], self.recursive_cb.isChecked(),
+                             self.library_root)
+        if not self.lossy_cb.isChecked():
+            files = filter_lossless(files)
+        if not files:
+            self.status.setText("No source files found in folder.")
+            return
+
+        out = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Output folder for MP3s (library layout is mirrored)",
+            self.out_dir or os.path.expanduser("~"))
+        if not out:
+            return
+        err = check_out_dir(out, [self.scan_dir])
+        if err:
+            QtWidgets.QMessageBox.warning(self, "Bad output folder", err)
+            return
+        self.out_dir = out
+
+        quality = self.quality_combo.currentText()
+        answer = QtWidgets.QMessageBox.question(
+            self, "Bulk convert",
+            f"Convert {len(files)} file(s) to MP3 {quality} into\n{out}?\n\n"
+            "Your originals are not modified, and anything already converted "
+            "there is skipped.")
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        self.progress.setRange(0, len(files))
+        self.progress.setValue(0)
+        self.status.setText(f"Converting {len(files)} file(s)…")
+        self.btn_bulk.setText("Stop")
+        self.btn_scan.setEnabled(False)
+
+        jobs = os.cpu_count() or 2
+        self.bulk_worker = BulkConvertWorker(files, out, quality, jobs)
+        self.bulk_worker.progress.connect(self._bulk_progress)
+        self.bulk_worker.finished_summary.connect(self._bulk_done)
+        self.bulk_worker.start()
+
+    def _bulk_progress(self, done, total, src):
+        self.progress.setValue(done)
+        self.status.setText(f"Converting {done}/{total} — {os.path.basename(src)}")
+
+    def _bulk_done(self, summary):
+        self.btn_bulk.setText("Convert folder to MP3…")
+        self.btn_scan.setEnabled(True)
+        head = "Stopped" if summary.stopped else "Bulk convert done"
+        self.status.setText(
+            f"{head} — {summary.converted} converted, {summary.skipped} skipped, "
+            f"{summary.failed} failed.")
+        if not summary.failures:
+            return
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Some conversions failed")
+        box.setText(f"{summary.failed} file(s) could not be converted.")
+        box.setDetailedText("\n\n".join(f"{src}\n  {msg}"
+                                        for src, msg in summary.failures))
+        save = box.addButton("Save list…", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is save:
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save failure list", os.path.join(self.out_dir, "failed.txt"))
+            if path:
+                with open(path, "w") as fh:
+                    for src, msg in summary.failures:
+                        fh.write(f"{src}\t{msg}\n")
 
 
 DARK_QSS = """
