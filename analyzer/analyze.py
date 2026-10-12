@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from typing import Optional
 
+import numpy as np
+
 from . import decode, dsp, verdict
-from .model import AnalysisResult, Metrics, Spectrum, Verdict
+from .model import AnalysisResult, Metrics, Spectrum, StreamInfo, Verdict
 
 
 def analyze_file(
@@ -22,19 +25,23 @@ def analyze_file(
     try:
         info = decode.probe(path)
     except Exception as e:  # noqa: BLE001 - report, don't crash the scan
-        res = AnalysisResult(info=_empty_info(path))
+        res = AnalysisResult(info=StreamInfo(path=path))
         res.error = f"probe failed: {e}"
         return res
 
     res = AnalysisResult(info=info)
     try:
         raw = decode.decode_int32(info, max_seconds=max_seconds)
-        pcm = raw.astype("float64") / 2147483648.0
+        m = Metrics()
+        m.effective_bits = dsp.effective_bits(raw)
+        # float32 holds 24-bit PCM exactly and halves memory vs float64. The
+        # raw buffer is dropped as soon as it has been converted.
+        pcm = raw.astype(np.float32)
+        del raw
+        pcm *= np.float32(1.0 / 2147483648.0)
         mono = dsp.to_mono(pcm)
         sr = info.sample_rate
 
-        m = Metrics()
-        m.effective_bits = dsp.effective_bits(raw)
         m.peak_dbfs, m.rms_dbfs, m.crest_db = dsp.peak_rms_crest(pcm)
         m.dr = dsp.dynamic_range(pcm, sr)
         m.clipped_samples, m.clip_runs, m.clip_pct = dsp.clipping(pcm, m.effective_bits)
@@ -70,7 +77,16 @@ def scan_one(path: str) -> AnalysisResult:
     return analyze_file(path, want_spectrogram=False)
 
 
-def _empty_info(path: str):
-    from .model import StreamInfo
+def result_or_error(fut: Future, path: str) -> AnalysisResult:
+    """A scan future's result, or an ERROR result if its worker process died.
 
-    return StreamInfo(path=path)
+    analyze_file already turns decode/analysis failures into ERROR results;
+    what's left is the pool itself breaking (e.g. a worker OOM-killed on a
+    huge file), which would otherwise abort the scan and lose every result.
+    """
+    try:
+        return fut.result()
+    except Exception as e:  # noqa: BLE001
+        res = AnalysisResult(info=StreamInfo(path=path))
+        res.error = f"worker failed: {e or type(e).__name__}"
+        return res

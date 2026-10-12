@@ -102,11 +102,12 @@ python3 -m venv .venv
 ./cli.py ~/Music -r --bulk-convert --out ~/ipod --dry-run
 ```
 
-`--convert` encodes the convertible files (table above), mirrors the folder
-layout under `--out` (`~/Music/Artist/Album/01.flac` → `~/ipod/Artist/Album/01.mp3`,
+`--convert` encodes the convertible files (table above) in parallel, mirrors the
+folder layout under `--out` (required, and checked before the scan starts) (`~/Music/Artist/Album/01.flac` → `~/ipod/Artist/Album/01.mp3`,
 so same-named tracks from different albums don't collide), then prints the files
 to review by hand and the files it skipped. Existing MP3s are left alone, so
-re-running only encodes new files.
+re-running only encodes new files. `--dry-run`, `--overwrite` and `--error-log`
+work here the same way as for bulk convert below.
 
 ### Bulk convert
 
@@ -132,7 +133,9 @@ to a `.part` file and renamed only on success, so a killed run never leaves a
 truncated MP3 that a later run would mistake for finished work.
 
 Lossy sources are skipped by default: re-encoding an MP3 to MP3 only loses more
-quality, and it keeps a re-run from picking up its own output. Pointing `--out`
+quality, and it keeps a re-run from picking up its own output. `.m4a` and `.wma`
+can be either lossy or lossless, so those are probed and judged by codec (ALAC
+and WMA Lossless are kept, AAC and WMA are skipped). Pointing `--out`
 inside the folder you're scanning is refused for the same reason.
 
 #### Folder layout in the output
@@ -191,6 +194,9 @@ Measured on real 44.1k masters passed through LAME 3.100 and re-wrapped as FLAC:
   other encoders do cut at ~19.5 kHz and are detected.)
 - **Genuine anti-alias filters** at 21–22 kHz can be very steep (up to 50 dB);
   they're recognized by position and don't count against the file.
+- **48 kHz files** are judged against the same lowpass positions as 44.1k ones
+  (encoders pick the same cutoffs). A CD master resampled to 48k keeps its old
+  ~21 kHz edge; that is recognized as a clean source, not a 320k transcode.
 
 The tool reports evidence, not just a verdict — when in doubt, look at the
 spectrogram: a transcode shows a razor-sharp edge that stays at the same

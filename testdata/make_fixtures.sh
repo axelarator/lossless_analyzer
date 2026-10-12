@@ -56,6 +56,13 @@ ff -i genuine_44k.flac \
 ff -i fake_from_mp3_128.flac \
     -af "aresample=96000:resampler=soxr:precision=28" -sample_fmt s32 upsampled_from_mp3_96k.flac
 
+# 48k: a CD master resampled to 48k keeps a steep edge at ~21 kHz. That's a
+# clean source, not a lossy wall. A real 320k transcode at 48k cuts ~20 kHz.
+ff -i genuine_44k.flac \
+    -af "aresample=48000:resampler=soxr" -sample_fmt s16 cd_resampled_48k.flac
+ff -f lavfi -i "${MUSIC//r=44100/r=48000}" -ac 2 -sample_fmt s16 music_genuine_48k.flac
+via_mp3 music_genuine_48k.flac -b:a 320k music_fake_48k_320.flac
+
 # Openly lossy file.
 ff -i music_genuine.flac -c:a libmp3lame -b:a 192k lossy_192.mp3
 

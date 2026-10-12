@@ -58,6 +58,10 @@ EXPECTED = {
     "music_fake_320.flac": ({Verdict.SUSPECT, Verdict.LIKELY_FAKE}, False, "320"),
     "quiet_fake_128.flac": ({Verdict.SUSPECT, Verdict.LIKELY_FAKE}, False, "128"),
     "upsampled_from_mp3_96k.flac": ({Verdict.UPSAMPLED}, False, "128"),
+    # Was "likely fake (MP3 ~320)": the CD edge on a 48k file sits ~21 kHz.
+    "cd_resampled_48k.flac": ({Verdict.GENUINE}, True, None),
+    "music_genuine_48k.flac": ({Verdict.GENUINE}, True, None),
+    "music_fake_48k_320.flac": ({Verdict.SUSPECT, Verdict.LIKELY_FAKE}, False, "320"),
     "lossy_192.mp3": ({Verdict.LOSSY}, False, None),
 }
 
@@ -116,6 +120,27 @@ class TestClassify(unittest.TestCase):
         # A dull genuine master: moderate edge, but the band keeps falling.
         m = Metrics(wall_hz=17340, wall_drop_db=16.6, shelf_db=-84.5, noise_floor_db=-87.9)
         v, *_ = classify(_info(), m)
+        self.assertEqual(v, Verdict.GENUINE)
+
+    def test_cd_edge_on_48k_file_is_genuine(self):
+        # 44.1k master resampled to 48k: steep, flat-shelved edge at ~21 kHz.
+        m = Metrics(wall_hz=21000, wall_drop_db=80, shelf_db=-104, noise_floor_db=-104)
+        v, *_ = classify(_info(sr=48000), m)
+        self.assertEqual(v, Verdict.GENUINE)
+
+    def test_320k_wall_on_48k_file_is_flagged(self):
+        m = Metrics(wall_hz=20160, wall_drop_db=47, shelf_db=-104, noise_floor_db=-104)
+        v, _, _, source = classify(_info(sr=48000), m)
+        self.assertIn(v, (Verdict.SUSPECT, Verdict.LIKELY_FAKE))
+        self.assertIn("320", source)
+
+    def test_192k_wall_on_48k_file_is_fake(self):
+        m = Metrics(wall_hz=18780, wall_drop_db=52, shelf_db=-104, noise_floor_db=-104)
+        v, *_ = classify(_info(sr=48000), m)
+        self.assertEqual(v, Verdict.LIKELY_FAKE)
+
+    def test_wma_lossless_is_not_lossy(self):
+        v, *_ = classify(_info(codec="wmalossless"), Metrics(wall_hz=21000))
         self.assertEqual(v, Verdict.GENUINE)
 
     def test_source_table_matches_measured_lame_walls(self):
@@ -300,6 +325,41 @@ class TestGather(unittest.TestCase):
     def test_mirror_root_defaults_to_the_parent(self):
         self.assertEqual(mirror_root("/Music/Artist"), "/Music")
         self.assertEqual(mirror_root("/Music/Artist", "/Music"), "/Music")
+
+
+@unittest.skipUnless(have_tools(), "ffmpeg/ffprobe not installed")
+class TestLosslessFilter(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_m4a_is_judged_by_codec_not_extension(self):
+        src = fixture("music_genuine.flac")
+        for name, codec in (("aac.m4a", "aac"), ("alac.m4a", "alac")):
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", src, "-c:a", codec,
+                            os.path.join(self.tmp, name)], check=True)
+        files = gather_files([self.tmp], recursive=True)
+        self.assertEqual(sorted(os.path.basename(p) for p in filter_lossless(files)),
+                         ["alac.m4a"])
+
+
+class TestCli(unittest.TestCase):
+    def _run(self, *args):
+        return subprocess.run([sys.executable, os.path.join(ROOT, "cli.py"), *args],
+                              capture_output=True, text=True)
+
+    def test_convert_needs_out_dir(self):
+        proc = self._run(TESTDATA, "--convert")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--out", proc.stderr)
+
+    def test_convert_rejects_out_dir_inside_library(self):
+        proc = self._run(TESTDATA, "--convert", "--out", os.path.join(TESTDATA, "mp3"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("inside the scanned folder", proc.stderr)
+        self.assertNotIn("Scanning", proc.stderr)  # refused before the scan
 
 
 @unittest.skipUnless(have_tools(), "ffmpeg/ffprobe not installed")

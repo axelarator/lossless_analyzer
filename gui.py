@@ -23,6 +23,7 @@ from matplotlib.figure import Figure  # noqa: E402
 from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from analyzer import analyze_file, scan_one  # noqa: E402
+from analyzer.analyze import result_or_error  # noqa: E402
 from analyzer.bulk import (  # noqa: E402
     bulk_convert, check_out_dir, filter_lossless, gather_files, mirror_root,
 )
@@ -59,7 +60,7 @@ class ScanWorker(QtCore.QThread):
             for fut in as_completed(futs):
                 if self._stop:
                     break
-                self.result.emit(fut.result())
+                self.result.emit(result_or_error(fut, futs[fut]))
                 done += 1
                 self.progress.emit(done, total)
         finally:
@@ -224,6 +225,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # folder you picked is reproduced in the output. Set it to your library
         # root to keep paths identical no matter which subfolder you convert.
         self.library_root: str | None = None
+        # Selection is debounced: arrowing through the table would otherwise
+        # start a full decode for every row passed over.
+        self.detail_timer = QtCore.QTimer(self)
+        self.detail_timer.setSingleShot(True)
+        self.detail_timer.setInterval(150)
+        self.detail_timer.timeout.connect(self._load_detail)
 
         self._build_ui()
         if not have_tools():
@@ -428,9 +435,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_scan.setText("Scan")
         self.table.setSortingEnabled(True)
         n = len(self.results)
-        fakes = sum(1 for r in self.results.values() if r.verdict != Verdict.GENUINE)
+        errors = sum(1 for r in self.results.values() if r.verdict == Verdict.ERROR)
+        flagged = sum(1 for r in self.results.values()
+                      if r.verdict not in (Verdict.GENUINE, Verdict.ERROR))
         good = sum(1 for r in self.results.values() if r.convertible)
-        self.status.setText(f"Done — {n} file(s), {fakes} flagged, {good} OK to convert.")
+        self.status.setText(
+            f"Done — {n} file(s), {flagged} flagged, {good} OK to convert"
+            + (f", {errors} could not be read." if errors else "."))
 
     def add_result(self, res: AnalysisResult):
         self.results[res.info.path] = res
@@ -505,7 +516,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_convert.setEnabled(res.verdict != Verdict.ERROR)
         self.btn_folder.setEnabled(True)
         self._show_text(res)
+        if res.spectrum is not None and res.spectrum.spec_db.size > 1:
+            self.detail_timer.stop()
+            self.plot.show_result(res)  # spectrogram already computed
+            return
+        if res.verdict == Verdict.ERROR:
+            self.detail_timer.stop()
+            self.plot.clear_plot("No spectrum available")
+            return
         self.plot.clear_plot("Computing spectrogram…")
+        self.detail_timer.start()
+
+    def _load_detail(self):
+        path = self._selected_path()
+        if not path:
+            return
         # Compute the spectrogram off-thread.
         worker = DetailWorker(path)
         worker.ready.connect(self._on_detail)

@@ -40,13 +40,14 @@ import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from analyzer import analyze_file
+from analyzer import scan_one
+from analyzer.analyze import result_or_error
 from analyzer.bulk import (
     SKIP_MARKER, bulk_convert, check_out_dir, filter_lossless, gather_files,
 )
 from analyzer.decode import have_tools
 from analyzer.model import Verdict
-from analyzer.convert import DEFAULT_QUALITY, PRESETS, convert_to_mp3
+from analyzer.convert import DEFAULT_QUALITY, PRESETS
 
 # ANSI colors for the terminal table.
 _C = {
@@ -58,11 +59,6 @@ _C = {
     Verdict.ERROR: "\033[90m",
 }
 _RESET = "\033[0m"
-
-
-def _worker(path: str):
-    # Spectrogram is GUI-only; skip it for speed in batch mode.
-    return analyze_file(path, want_spectrogram=False)
 
 
 def print_row(res, use_color: bool):
@@ -89,26 +85,32 @@ def print_row(res, use_color: bool):
     print(line)
 
 
-def run_bulk_convert(args, files, use_color: bool) -> int:
-    """Encode everything in ``files`` to MP3. Returns a process exit code."""
+def out_dir_error(args) -> str | None:
+    """Why ``--out`` can't be used for converting, or None if it's fine."""
+    flag = "--bulk-convert" if args.bulk_convert else "--convert"
     if not args.out:
         # Without an output directory the MP3s would land next to every source,
-        # scattering thousands of files through the library.
-        print("error: --bulk-convert needs --out DIR", file=sys.stderr)
-        return 1
+        # scattering thousands of files through the library (and the next scan
+        # would pick them up).
+        return f"{flag} needs --out DIR"
+    return check_out_dir(args.out, args.paths)
+
+
+def run_bulk_convert(args, files, use_color: bool) -> int:
+    """Encode everything in ``files`` to MP3. Returns a process exit code."""
     if not args.include_lossy:
         files = filter_lossless(files)
     if not files:
         print("no lossless source files found (use --include-lossy to convert "
               "lossy sources too)", file=sys.stderr)
         return 1
-    err = check_out_dir(args.out, args.paths)
-    if err:
-        print(f"error: {err}", file=sys.stderr)
-        return 1
+    return encode(args, files, use_color)
 
+
+def encode(args, files, use_color: bool) -> int:
+    """Encode ``files`` in parallel, report progress and failures."""
     total = len(files)
-    # Bulk encoding gets every core: one libmp3lame encode is single-threaded,
+    # Encoding gets every core: one libmp3lame encode is single-threaded,
     # unlike the analysis pass which is memory-hungry and defaults to half.
     jobs = args.jobs or (os.cpu_count() or 2)
     verb = "Would convert" if args.dry_run else "Converting"
@@ -185,8 +187,9 @@ def main(argv=None):
     ap.add_argument("--json", metavar="FILE", help="write a JSON report")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--convert", "--convert-genuine", dest="convert", action="store_true",
-                    help="convert good sources (genuine, or upsampled/padded CD quality) "
-                         "to MP3; suspects are listed for review, fakes are skipped")
+                    help="after scanning, convert good sources (genuine, or upsampled/"
+                         "padded CD quality) to MP3 under --out; suspects are listed "
+                         "for review, fakes are skipped")
     ap.add_argument("--quality", default=DEFAULT_QUALITY, choices=list(PRESETS),
                     help=f"MP3 preset for conversion (default {DEFAULT_QUALITY})")
     ap.add_argument("--out", help="output directory for conversions "
@@ -202,12 +205,14 @@ def main(argv=None):
                     help="re-encode files whose MP3 already exists (default: skip them, "
                          "so an interrupted run resumes where it left off)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="with --bulk-convert, list what would be written and exit")
+                    help="with --convert/--bulk-convert, list what would be written "
+                         "instead of encoding")
     ap.add_argument("--include-lossy", action="store_true",
                     help="with --bulk-convert, also convert lossy sources (mp3, ogg, ...) "
                          "instead of only lossless ones")
     ap.add_argument("--error-log", metavar="FILE",
-                    help="with --bulk-convert, write failed sources and their errors here")
+                    help="with --convert/--bulk-convert, write failed sources and their "
+                         "errors here")
     args = ap.parse_args(argv)
 
     if not have_tools():
@@ -222,6 +227,12 @@ def main(argv=None):
 
     use_color = sys.stdout.isatty() and not args.no_color
 
+    if args.convert or args.bulk_convert:
+        # Checked up front, so a bad --out doesn't cost a full scan first.
+        err = out_dir_error(args)
+        if err:
+            sys.exit(f"error: {err}")
+
     if args.bulk_convert:
         sys.exit(run_bulk_convert(args, files, use_color))
 
@@ -234,9 +245,9 @@ def main(argv=None):
                  Verdict.LOSSY, Verdict.ERROR}
 
     with ProcessPoolExecutor(max_workers=jobs) as ex:
-        futs = {ex.submit(_worker, f): f for f in files}
+        futs = {ex.submit(scan_one, f): f for f in files}
         for fut in as_completed(futs):
-            res = fut.result()
+            res = result_or_error(fut, futs[fut])
             results.append(res)
             counts[res.verdict] = counts.get(res.verdict, 0) + 1
             if args.suspect_only and res.verdict not in show_only:
@@ -268,15 +279,10 @@ def main(argv=None):
         review = [r for r in results if not r.convertible
                   and r.verdict in (Verdict.SUSPECT, Verdict.UPSAMPLED)]
         skipped = [r for r in results if r.verdict in (Verdict.LIKELY_FAKE, Verdict.LOSSY)]
-        print(f"\nConverting {len(good)} file(s) to MP3 {args.quality}...", file=sys.stderr)
-        failed = 0
-        for r in good:
-            cr = convert_to_mp3(r.info.path, out_dir=args.out, quality=args.quality,
-                                overwrite=args.overwrite,
-                                rel_to=files.get(r.info.path))
-            failed += not cr.ok
-            status = "ok" if cr.ok else "FAIL"
-            print(f"  [{status}] {cr.output or r.info.path} — {cr.message}", file=sys.stderr)
+        code = 0
+        if good:
+            print(file=sys.stderr)
+            code = encode(args, {r.info.path: files[r.info.path] for r in good}, use_color)
         if review:
             print(f"\nNot converted — review the spectrogram in the GUI ({len(review)}):",
                   file=sys.stderr)
@@ -287,8 +293,7 @@ def main(argv=None):
             print(f"\nSkipped — lossy or likely lossy-sourced ({len(skipped)}):", file=sys.stderr)
             for r in skipped:
                 print(f"  {r.info.path}  [{r.verdict.label}]", file=sys.stderr)
-        if failed:
-            sys.exit(f"\n{failed} conversion(s) failed")
+        sys.exit(code)
 
 
 if __name__ == "__main__":

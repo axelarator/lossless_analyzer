@@ -18,16 +18,19 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from .convert import DEFAULT_QUALITY, ConvertResult, convert_to_mp3, output_path
-from .decode import AUDIO_EXTS
+from .decode import AUDIO_EXTS, is_lossless_codec, probe
 
 # The subset of AUDIO_EXTS worth feeding to the encoder. Transcoding an MP3 to
 # MP3 only loses quality, and skipping lossy sources also stops a second run
 # from picking up its own output if the output directory ever lands inside the
 # music folder.
 LOSSLESS_EXTS = {
-    ".flac", ".wav", ".aiff", ".aif", ".alac", ".m4a", ".ape", ".wv",
-    ".dsf", ".dff",
+    ".flac", ".wav", ".aiff", ".aif", ".aifc", ".alac", ".ape", ".wv",
+    ".tta", ".tak", ".dsf", ".dff",
 }
+# Containers that hold either kind (.m4a is AAC or ALAC, .wma is WMA or WMA
+# Lossless): the codec decides, so these are probed.
+MIXED_EXTS = {".m4a", ".wma"}
 
 # convert_to_mp3 reports a pre-existing output as a success; this is how we
 # tell "already there" apart from "just encoded it".
@@ -88,10 +91,23 @@ def gather_files(paths: Iterable[str], recursive: bool,
     return dict(sorted(files.items()))
 
 
+def _probes_lossless(path: str) -> bool:
+    try:
+        return is_lossless_codec(probe(path).codec)
+    except Exception:  # noqa: BLE001 - unreadable: leave it out
+        return False
+
+
 def filter_lossless(files: dict[str, str | None]) -> dict[str, str | None]:
     """Drop lossy sources (already-MP3s and friends) from a gathered mapping."""
+    def ext(p):
+        return os.path.splitext(p)[1].lower()
+
+    mixed = [p for p in files if ext(p) in MIXED_EXTS]
+    with ThreadPoolExecutor(max_workers=min(len(mixed), 16) or 1) as ex:
+        lossless_mixed = {p for p, ok in zip(mixed, ex.map(_probes_lossless, mixed)) if ok}
     return {p: root for p, root in files.items()
-            if os.path.splitext(p)[1].lower() in LOSSLESS_EXTS}
+            if ext(p) in LOSSLESS_EXTS or p in lossless_mixed}
 
 
 def check_out_dir(out_dir: str, paths: Iterable[str]) -> str | None:

@@ -2,6 +2,10 @@
 
 Pure numpy. All functions take PCM as float (channels-last) and the sample
 rate, and return plain numbers / arrays.
+
+PCM is float32 and the measurements avoid full-length temporaries (``abs(x)``,
+``x**2``) where they can: a scan runs several files at once, and a long hi-res
+track is hundreds of millions of samples.
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ def effective_bits(raw_int32: np.ndarray) -> int:
     if flat.size == 0:
         return 0
     # Work in uint32 space; trailing zeros are unaffected by the sign bit.
-    orv = int(np.bitwise_or.reduce(flat.astype(np.uint32)))
+    # A view, not a copy.
+    orv = int(np.bitwise_or.reduce(flat.view(np.uint32)))
     if orv == 0:
         return 0  # pure silence
     trailing = (orv & -orv).bit_length() - 1
@@ -51,11 +56,13 @@ def peak_rms_crest(pcm: np.ndarray) -> tuple[float, float, float]:
     """
     if pcm.ndim == 1:
         pcm = pcm[:, None]
+    peak = rms = 0.0
     if pcm.size:
-        peak = float(np.max(np.abs(pcm)))
-        rms = float(np.max(np.sqrt(np.mean(pcm**2, axis=0))))
-    else:
-        peak = rms = 0.0
+        n = pcm.shape[0]
+        for c in range(pcm.shape[1]):
+            x = pcm[:, c]
+            peak = max(peak, float(x.max()), -float(x.min()))
+            rms = max(rms, float(np.sqrt(np.dot(x, x) / n)))
     peak_db = 20.0 * np.log10(max(peak, EPS))
     rms_db = 20.0 * np.log10(max(rms, EPS))
     return peak_db, rms_db, peak_db - rms_db
@@ -82,11 +89,11 @@ def dynamic_range(pcm: np.ndarray, sr: int) -> float:
     for c in range(pcm.shape[1]):
         x = pcm[: n_blocks * block, c].reshape(n_blocks, block)
         # 2x convention from the spec.
-        block_rms = np.sqrt(2.0 * np.mean(x**2, axis=1))
+        block_rms = np.sqrt(2.0 * np.einsum("ij,ij->i", x, x) / block)
         n_top = max(int(round(0.2 * n_blocks)), 1)
         top = np.sort(block_rms)[::-1][:n_top]
         rms_avg = np.sqrt(np.mean(top**2))
-        block_peak = np.sort(np.abs(x).max(axis=1))
+        block_peak = np.sort(np.maximum(x.max(axis=1), -x.min(axis=1)))
         peak2 = block_peak[-2] if block_peak.size >= 2 else block_peak[-1]
         dr = 20.0 * np.log10(max(peak2, EPS) / max(rms_avg, EPS))
         drs.append(dr)
@@ -109,7 +116,8 @@ def clipping(pcm: np.ndarray, eff_bits: int, run_len: int = 3) -> tuple[int, int
     total_clipped = 0
     total_runs = 0
     for c in range(pcm.shape[1]):
-        hot = np.abs(pcm[:, c]) >= thresh
+        x = pcm[:, c]
+        hot = (x >= thresh) | (x <= -thresh)
         if not hot.any():
             continue
         # Find runs of consecutive True values.

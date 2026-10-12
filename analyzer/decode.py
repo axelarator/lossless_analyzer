@@ -23,9 +23,18 @@ FFPROBE = shutil.which("ffprobe") or "ffprobe"
 # Audio extensions worth scanning. We can analyze lossy too (useful to confirm
 # a file really is what its extension claims).
 AUDIO_EXTS = {
-    ".flac", ".wav", ".aiff", ".aif", ".alac", ".m4a", ".ape", ".wv",
-    ".mp3", ".ogg", ".opus", ".aac", ".wma", ".dsf", ".dff",
+    ".flac", ".wav", ".aiff", ".aif", ".aifc", ".alac", ".m4a", ".ape", ".wv",
+    ".tta", ".tak", ".mp3", ".ogg", ".opus", ".aac", ".wma", ".dsf", ".dff",
 }
+
+LOSSLESS_CODECS = {
+    "flac", "alac", "ape", "wavpack", "tta", "tak", "mlp", "truehd", "wmalossless",
+    "dsd_lsbf", "dsd_msbf", "dsd_lsbf_planar", "dsd_msbf_planar",
+}
+
+
+def is_lossless_codec(codec: str) -> bool:
+    return codec in LOSSLESS_CODECS or codec.startswith("pcm_")
 
 
 class DecodeError(RuntimeError):
@@ -79,18 +88,6 @@ def probe(path: str) -> StreamInfo:
         artist=tags.get("artist", ""),
         album=tags.get("album", ""),
     )
-
-
-def decode_pcm(
-    info: StreamInfo, max_seconds: Optional[float] = None
-) -> np.ndarray:
-    """Decode to a float64 array shaped (frames, channels), range ~[-1, 1].
-
-    Returns the raw signed-32-bit data scaled by 2**31 so that bit-depth
-    inspection is still possible by the caller via ``raw_int32``.
-    """
-    raw = decode_int32(info, max_seconds)
-    return raw.astype(np.float64) / 2147483648.0
 
 
 def decode_int32(

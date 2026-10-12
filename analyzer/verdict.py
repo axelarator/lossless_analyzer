@@ -18,16 +18,8 @@ detectable by this method.
 
 from __future__ import annotations
 
+from .decode import is_lossless_codec
 from .model import StreamInfo, Metrics, Verdict
-
-LOSSLESS_CODECS = {
-    "flac", "alac", "ape", "wavpack", "tta", "tak", "mlp", "truehd",
-    "dsd_lsbf", "dsd_msbf", "dsd_lsbf_planar", "dsd_msbf_planar",
-}
-
-
-def _is_lossless(codec: str) -> bool:
-    return codec in LOSSLESS_CODECS or codec.startswith("pcm_")
 
 
 # Wall steepness (dB dropped between ~1 kHz windows either side of the edge).
@@ -43,6 +35,15 @@ WALL_FAKE = 35.0      # this steep below Nyquist = artificial lowpass
 WALL_SUSPECT = 30.0   # ambiguously steep — surface it but stay unsure
 WALL_SOFT = 15.0      # moderate edge; only suspicious with a flat shelf
 FLAT_SHELF_DB = 1.0   # |shelf - floor| below this = dead-flat band above the edge
+
+# Wall positions are judged against CD Nyquist even for 48k files: lossy
+# encoders pick the same lowpass at 44.1k and 48k. At 44.1k the cut points are
+# 0.90 / 0.92 / 0.95 of 22.05 kHz (19.85 / 20.29 / 20.95 kHz).
+CD_NYQUIST = 22050.0
+# A 44.1k master resampled to 48k keeps its old band edge, measured at
+# 20.9-21.5 kHz across soxr and swr settings; 320k LAME at 48k measures
+# ~20.2 kHz. Walls above this on a 48k file are not lossy evidence.
+RESAMPLED_CD_EDGE_HZ = 20600.0
 
 # Measured wall positions (steepest-step frequency, slightly below LAME's
 # nominal lowpass) -> likely source. AAC and other encoders use different
@@ -73,7 +74,9 @@ def classify(info: StreamInfo, m: Metrics) -> tuple[Verdict, float, list[str], s
     nyq = info.nyquist or 1.0
     wall = m.wall_hz
     drop = m.wall_drop_db
-    rel = wall / nyq
+    # Position relative to CD Nyquist (or the real one, if lower).
+    rel = wall / min(nyq, CD_NYQUIST)
+    filter_rel = 0.95 if sr <= 44100 else RESAMPLED_CD_EDGE_HZ / CD_NYQUIST
     flat_shelf = abs(m.shelf_db - m.noise_floor_db) <= FLAT_SHELF_DB
 
     edge_note = (
@@ -82,7 +85,7 @@ def classify(info: StreamInfo, m: Metrics) -> tuple[Verdict, float, list[str], s
     )
 
     # --- Openly lossy file: nothing to authenticate ------------------------ #
-    if not _is_lossless(info.codec):
+    if not is_lossless_codec(info.codec):
         reasons.append(
             f"Codec is {info.codec or 'unknown'} — a lossy format, not a lossless "
             f"source. Re-encoding it to MP3 would only lose more."
@@ -129,6 +132,15 @@ def classify(info: StreamInfo, m: Metrics) -> tuple[Verdict, float, list[str], s
 
     # --- Lossy transcode hidden in a lossless container -------------------- #
     if sr <= 48000:
+        if rel >= filter_rel and drop >= WALL_SUSPECT and sr > 44100:
+            reasons.insert(0, edge_note)
+            reasons.append(
+                f"Wall sits where a {sr/1000:g} kHz anti-alias filter, or a 44.1 kHz "
+                f"master resampled to {sr/1000:g} kHz, puts it — not a lossy "
+                f"transcode."
+            )
+            return Verdict.GENUINE, 0.8, reasons, ""
+
         if drop >= WALL_FAKE and rel < 0.97:
             source = _suspected_source(wall)
             reasons.insert(0, edge_note)
@@ -143,7 +155,7 @@ def classify(info: StreamInfo, m: Metrics) -> tuple[Verdict, float, list[str], s
                 depth = min((0.90 - rel) / 0.20, 1.0)
                 conf = min(0.72 + 0.2 * depth + (drop - WALL_FAKE) / 300.0, 0.97)
                 return Verdict.LIKELY_FAKE, conf, reasons, source
-            elif rel < 0.95:
+            elif rel < filter_rel:
                 # ~20-21 kHz: 320k transcode vs. a tight anti-alias filter —
                 # genuinely hard to call. Flag, but only as suspect.
                 conf = min(0.5 + (drop - WALL_FAKE) / 250.0, 0.7)
@@ -152,7 +164,7 @@ def classify(info: StreamInfo, m: Metrics) -> tuple[Verdict, float, list[str], s
                     "can't be ruled out — check the spectrogram."
                 )
                 return Verdict.SUSPECT, conf, reasons, source
-            # rel >= 0.95: wall is at Nyquist => normal anti-alias filter. The
+            # rel >= filter_rel: wall at Nyquist => normal anti-alias filter. The
             # cliff search stops 1 kHz short of Nyquist (dsp.estimate_cutoff),
             # so filters at 21.5-22 kHz register at that ~0.95 ceiling.
             reasons.append(
